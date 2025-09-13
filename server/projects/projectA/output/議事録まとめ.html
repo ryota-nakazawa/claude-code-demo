@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>定例ミーティング議事録 - グラフィックレコード</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Kaisei+Decol&family=Yomogi&family=Zen+Kurenaido&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --fashion-1: #593C47;
+            --fashion-2: #F2E63D;
+            --fashion-3: #F2C53D;
+            --fashion-4: #F25C05;
+            --fashion-5: #F24405;
+            --text-primary: #334155;
+            --text-secondary: #475569;
+            --text-accent: #1e40af;
+        }
+
+        body {
+            font-family: 'Yomogi', cursive;
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            color: var(--text-primary);
+            line-height: 1.4;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            border: 3px solid var(--fashion-2);
+            border-style: dashed;
+            position: relative;
+        }
+
+        .header::before {
+            content: "📝";
+            position: absolute;
+            top: -20px;
+            left: 20px;
+            font-size: 40px;
+            background: white;
+            padding: 5px;
+            border-radius: 50%;
+        }
+
+        .title {
+            font-family: 'Zen Kurenaido', serif;
+            font-size: 32px;
+            font-weight: bold;
+            background: linear-gradient(45deg, var(--fashion-4), var(--fashion-5));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+        }
+
+        .date-info {
+            color: var(--text-secondary);
+            font-size: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .three-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(5px);
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            border: 2px solid transparent;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--fashion-2), var(--fashion-3), var(--fashion-4));
+        }
+
+        .section-title {
+            font-family: 'Kaisei Decol', serif;
+            font-size: 18px;
+            color: var(--text-accent);
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .basic-info {
+            border-left: 4px solid var(--fashion-2);
+        }
+
+        .purpose {
+            border-left: 4px solid var(--fashion-3);
+        }
+
+        .agenda {
+            border-left: 4px solid var(--fashion-4);
+        }
+
+        .action-item {
+            background: rgba(242, 230, 61, 0.1);
+            border: 2px dashed var(--fashion-2);
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            position: relative;
+        }
+
+        .action-item::before {
+            content: "✏️";
+            position: absolute;
+            top: -10px;
+            left: 10px;
+            background: white;
+            padding: 2px 6px;
+            border-radius: 10px;
+        }
+
+        .person-name {
+            font-weight: bold;
+            color: var(--fashion-1);
+            font-size: 16px;
+        }
+
+        .task-list {
+            list-style: none;
+            margin-top: 8px;
+        }
+
+        .task-list li {
+            margin: 5px 0;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        .task-list li::before {
+            content: "📌";
+            position: absolute;
+            left: 0;
+        }
+
+        .agenda-item {
+            background: rgba(242, 196, 61, 0.1);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 12px;
+            border-left: 4px solid var(--fashion-4);
+        }
+
+        .agenda-title {
+            font-weight: bold;
+            color: var(--fashion-5);
+            margin-bottom: 5px;
+        }
+
+        .highlight-box {
+            background: linear-gradient(135deg, var(--fashion-2), var(--fashion-3));
+            color: var(--fashion-1);
+            padding: 20px;
+            border-radius: 15px;
+            margin: 20px 0;
+            text-align: center;
+            font-weight: bold;
+            position: relative;
+        }
+
+        .highlight-box::before {
+            content: "🎯";
+            position: absolute;
+            top: -15px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: white;
+            padding: 5px;
+            border-radius: 50%;
+            font-size: 20px;
+        }
+
+        .stats {
+            display: flex;
+            justify-content: space-around;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--fashion-4);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .participants {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .participant {
+            background: var(--fashion-2);
+            color: var(--fashion-1);
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .arrow {
+            text-align: center;
+            font-size: 24px;
+            color: var(--fashion-4);
+            margin: 10px 0;
+        }
+
+        .footer {
+            background: rgba(255, 255, 255, 0.3);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-top: 40px;
+        }
+
+        .priority-high {
+            background: rgba(242, 68, 4, 0.1);
+            border: 2px solid var(--fashion-5);
+        }
+
+        .priority-medium {
+            background: rgba(242, 91, 4, 0.1);
+            border: 2px solid var(--fashion-4);
+        }
+
+        .priority-low {
+            background: rgba(242, 230, 61, 0.1);
+            border: 2px solid var(--fashion-2);
+        }
+
+        @media (max-width: 768px) {
+            .three-columns {
+                grid-template-columns: 1fr;
+            }
+
+            .title {
+                font-size: 24px;
+            }
+
+            .date-info {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="title">定例ミーティング議事録</h1>
+            <div class="date-info">
+                <span>📅 開催日: 今日開催（要確認）</span>
+                <span>🌐 オンライン音声会議</span>
+            </div>
+        </header>
+
+        <div class="three-columns">
+            <!-- 左列: 基本情報・目的 -->
+            <div>
+                <div class="card basic-info">
+                    <h2 class="section-title">🏢 会議基本情報</h2>
+                    <div style="margin-bottom: 15px;">
+                        <strong>📝 会議名:</strong> 定例ミーティング
+                    </div>
+                    <div style="margin-bottom: 15px;">
+                        <strong>📍 場所:</strong> オンライン（音声会議）
+                    </div>
+                    <div>
+                        <strong>👥 参加者:</strong>
+                        <div class="participants">
+                            <span class="participant">佐藤</span>
+                            <span class="participant">鈴木</span>
+                            <span class="participant">田中</span>
+                            <span class="participant">高橋</span>
+                            <span class="participant">伊藤</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card purpose">
+                    <h2 class="section-title">🎯 会議の目的</h2>
+                    <div class="highlight-box">
+                        先週のタスク進捗共有と課題解決、今後のアクション決め
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="section-title">📊 ABテスト結果</h2>
+                    <div class="stats">
+                        <div class="stat-item">
+                            <div class="stat-number">3.2%</div>
+                            <div class="stat-label">旧版CV率</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number">4.1%</div>
+                            <div class="stat-label">新版CV率</div>
+                        </div>
+                    </div>
+                    <p style="text-align: center; font-size: 14px;">土日まで継続、月曜に全面切り替え判断</p>
+                </div>
+            </div>
+
+            <!-- 中央列: 主要議題 -->
+            <div>
+                <div class="card agenda">
+                    <h2 class="section-title">💬 主要議題と決定事項</h2>
+
+                    <div class="agenda-item priority-high">
+                        <div class="agenda-title">🔧 API連携実装の進捗</div>
+                        <p>実装半分完了、テストコード金曜完成予定。エラーハンドリング仕様を夜までにNotionに上げる</p>
+                    </div>
+
+                    <div class="agenda-item priority-high">
+                        <div class="agenda-title">⚠️ フロント側のバリデーション問題</div>
+                        <p>入力値null時にサーバ側で500エラー。鈴木さんが対応確認予定</p>
+                    </div>
+
+                    <div class="agenda-item priority-medium">
+                        <div class="agenda-title">📋 QAフロー・チェックリスト</div>
+                        <p>チェックリストがまだ未共有。佐藤さんが今日中にSlack流す</p>
+                    </div>
+
+                    <div class="agenda-item priority-medium">
+                        <div class="agenda-title">🚀 リリース準備</div>
+                        <p>バージョン番号がドキュメントと実装で食い違い。タグ付け前に確認必要</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="section-title">⚡ パフォーマンス調整</h2>
+                    <div class="agenda-item priority-medium">
+                        <div class="agenda-title">🎲 APIタイムアウト調整</div>
+                        <p><strong>現状:</strong> 10秒設定、負荷テストで8秒弱</p>
+                        <p><strong>目標:</strong> バックエンド6秒、最悪8秒に収める</p>
+                        <p><strong>理由:</strong> フロント7秒でスピナー外すため</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右列: アクション・その他 -->
+            <div>
+                <div class="card">
+                    <h2 class="section-title">📋 次のアクション</h2>
+
+                    <div class="action-item">
+                        <div class="person-name">鈴木</div>
+                        <ul class="task-list">
+                            <li>API実装＋テスト完成</li>
+                            <li>エラーハンドリング確認</li>
+                            <li>タイムアウト調整</li>
+                            <li>リトライメトリクス実装</li>
+                        </ul>
+                        <div style="text-align: right; color: var(--fashion-5); font-weight: bold; margin-top: 10px;">⏰ 金曜まで</div>
+                    </div>
+
+                    <div class="action-item">
+                        <div class="person-name">田中</div>
+                        <ul class="task-list">
+                            <li>APIドキュメントレビュー</li>
+                            <li>QAチェックリスト確認</li>
+                        </ul>
+                        <div style="text-align: right; color: var(--fashion-4); margin-top: 10px;">⏰ 要確認</div>
+                    </div>
+
+                    <div class="action-item">
+                        <div class="person-name">高橋</div>
+                        <ul class="task-list">
+                            <li>フロントのバリデーション対応</li>
+                            <li>バージョン番号整合確認</li>
+                        </ul>
+                        <div style="text-align: right; color: var(--fashion-4); margin-top: 10px;">⏰ 要確認</div>
+                    </div>
+
+                    <div class="action-item">
+                        <div class="person-name">伊藤</div>
+                        <ul class="task-list">
+                            <li>ABテスト継続</li>
+                            <li>結果共有</li>
+                        </ul>
+                        <div style="text-align: right; color: var(--fashion-3); margin-top: 10px;">⏰ 土日まで、月曜報告</div>
+                    </div>
+
+                    <div class="action-item">
+                        <div class="person-name">佐藤</div>
+                        <ul class="task-list">
+                            <li>QAチェックリスト仕上げ</li>
+                            <li>リリースノート修正</li>
+                            <li>障害訓練案内共有</li>
+                        </ul>
+                        <div style="text-align: right; color: var(--fashion-5); font-weight: bold; margin-top: 10px;">⏰ 今日中（チェックリスト）</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="section-title">🎪 展示会対応</h2>
+                    <div class="agenda-item priority-low">
+                        <div class="agenda-title">🌐 ネット回線不安定対策</div>
+                        <p><strong>課題:</strong> 来月展示会でのネット回線不安定</p>
+                        <div class="arrow">⬇️</div>
+                        <p><strong>対策:</strong> ローカルキャッシュ + リトライで対応</p>
+                        <p style="font-size: 12px; color: var(--text-secondary); margin-top: 5px;">※オフラインモードは工数的に厳しい</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="section-title">🔥 AWS障害訓練</h2>
+                    <div style="text-align: center; padding: 15px;">
+                        <div style="font-size: 18px; margin-bottom: 10px;">📅 スケジュール変更</div>
+                        <div style="background: rgba(242, 68, 4, 0.1); padding: 10px; border-radius: 8px; margin: 10px 0;">
+                            <s>火曜夕方</s> → <strong>木曜午前</strong>
+                        </div>
+                        <div style="font-size: 14px; color: var(--text-secondary);">正式案内は今夜送付予定</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer class="footer">
+            <p>📝 Created with Graphic Recording Style | 🤖 Generated with Claude Code</p>
+            <p>Co-Authored-By: Claude &lt;noreply@anthropic.com&gt;</p>
+        </footer>
+    </div>
+</body>
+</html>

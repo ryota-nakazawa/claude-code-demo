@@ -1,0 +1,18 @@
+# Python
+server/.venv/
+__pycache__/
+*.pyc
+
+# Node
+client/node_modules/
+client/.vite/
+dist/
+build/
+
+# Env files（秘匿）
+.env
+
+# OS/IDE
+.DS_Store
+.vscode/
+

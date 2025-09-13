@@ -1,0 +1,10 @@
+{
+  "name": "Project A",
+  "read_dirs": ["guideline", "input"],
+  "write_dir": "output",
+  "aliases": {
+    "@guideline": "guideline",
+    "@input": "input",
+    "@output": "output"
+  }
+}
