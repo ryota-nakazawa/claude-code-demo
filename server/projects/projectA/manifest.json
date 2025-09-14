@@ -1,10 +1,11 @@
 {
-  "name": "Project A",
-  "read_dirs": ["guideline", "input"],
+  "name": "projectA",
+  "read_dirs": ["input", "guideline"],
   "write_dir": "output",
   "aliases": {
-    "@guideline": "guideline",
     "@input": "input",
-    "@output": "output"
+    "@guideline": "guideline",
+    "@output": "output",
+    "@pending": "output_pending"
   }
 }

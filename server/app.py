@@ -1,26 +1,45 @@
 # server/app.py
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
-import pathlib
-import mimetypes
+import time
 import asyncio
-from typing import Dict, Any, List, Optional, Tuple
+import shutil
+import difflib
+import mimetypes
+import logging
+from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
-# Claude Code SDK
 from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions
 
-# ========== 基本設定 ==========
+# ------------------------------------------------------------
+# Logging & Flags
+# ------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+LOG = logging.getLogger("server")
+
+# SDK permission mode: "acceptEdits" (auto-apply) / "requestApproval" (SDK might ask)
+CLAUDE_PERMISSION_MODE = os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits")
+
+# Human approval flow: if true, write to output_pending first and require promote()
+REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "1") in ("1", "true", "True")
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
 
-app = FastAPI(title="Claude Code (Shared Projects)")
-
-# フロント（Vite）からのアクセスを許可
+# ------------------------------------------------------------
+# App
+# ------------------------------------------------------------
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -29,56 +48,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========== モデル ==========
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
 class AskBody(BaseModel):
     prompt: str
     project_id: str
 
-# ========== ユーティリティ（プロジェクト/パス） ==========
+class PromoteBody(BaseModel):
+    project_id: str
+    from_rel: str                 # e.g. "output_pending/議事録.md"
+    to_rel: Optional[str] = None  # default: same name under final_write_dir
+    overwrite: bool = True
+
+# ------------------------------------------------------------
+# Utils
+# ------------------------------------------------------------
 IGNORE_NAMES = {".git", "node_modules", ".venv", "__pycache__", "dist", "build", ".DS_Store"}
-MAX_PREVIEW_BYTES = 200 * 1024  # プレビュー上限
-MAX_READ_BYTES = 200 * 1024     # LLMにインライン投入する上限
-
-def load_manifest(project_id: str) -> Dict[str, Any]:
-    # project_id は英数/ハイフン/アンダースコアのみ
-    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", project_id):
-        raise HTTPException(400, "invalid project_id")
-    project_root = os.path.join(PROJECTS_DIR, project_id)
-    manifest_path = os.path.join(project_root, "manifest.json")
-    if not os.path.exists(manifest_path):
-        raise HTTPException(404, f"manifest not found: {project_id}")
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            m = json.load(f)
-    except Exception as e:
-        raise HTTPException(500, f"manifest parse error: {e}")
-
-    # 絶対パスへ解決 & 出力先を用意
-    read_dirs_abs: List[str] = []
-    for d in m.get("read_dirs", []):
-        read_dirs_abs.append(os.path.join(project_root, d))
-    write_dir = m.get("write_dir", "output")  # 既定は output
-    write_dir_abs = os.path.join(project_root, write_dir)
-    os.makedirs(write_dir_abs, exist_ok=True)
-
-    m["_project_root"] = project_root
-    m["_read_dirs_abs"] = read_dirs_abs
-    m["_write_dir_abs"] = write_dir_abs
-    return m
-
-def build_alias_hint(manifest: Dict[str, Any]) -> str:
-    aliases: Dict[str, str] = manifest.get("aliases", {})
-    if not aliases:
-        return ""
-    lines = ["\nPROJECT FILE ALIASES (use with @mention):"]
-    for k, v in aliases.items():
-        lines.append(f"- {k} => {v}")
-    lines.append(
-        "When the user mentions an alias (e.g., @input/foo.txt), resolve it relative to the project root.\n"
-        "Read-only dirs are listed in read_dirs; write files only under write_dir.\n"
-        "If an output path points to a directory, generate a sensible filename."
-    )
-    return "\n".join(lines)
+MAX_PREVIEW_BYTES = 200 * 1024
 
 def _is_subpath(child: str, parents: List[str]) -> bool:
     child = os.path.realpath(child)
@@ -96,50 +83,81 @@ def _safe_join(root: str, rel: str) -> str:
         raise HTTPException(400, "invalid path")
     return abspath
 
-# ========== メンション/パス解決 ==========
-_mention_re = re.compile(r"@([\w\-\._/一-龯ぁ-んァ-ン]+)")
+def _sse_headers():
+    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
-def _extract_mentions(s: str) -> List[str]:
-    return [m.group(1) for m in _mention_re.finditer(s)]
+def load_manifest(project_id: str) -> Dict[str, Any]:
+    safe = re.fullmatch(r"[a-zA-Z0-9_\-]+", project_id)
+    if not safe:
+        raise HTTPException(400, "invalid project_id")
+    project_root = os.path.join(PROJECTS_DIR, project_id)
+    manifest_path = os.path.join(project_root, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise HTTPException(404, f"manifest not found: {project_id}")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        m = json.load(f)
 
-def _aliases_maps(mani: Dict[str, Any]) -> Dict[str, str]:
-    ali = mani.get("aliases", {}) or {}
-    by_name: Dict[str, str] = {}
-    for k, v in ali.items():
-        key = k[1:] if k.startswith("@") else k
-        by_name[key] = v
-    return by_name
+    read_dirs_rel: List[str] = list(m.get("read_dirs", []))
+    read_dirs_abs: List[str] = [os.path.join(project_root, d) for d in read_dirs_rel]
 
-def _resolve_rel(project_root: str, mani: Dict[str, Any], token: str) -> str:
-    """@input/foo.txt のようなトークンを安全な相対パスに解決"""
-    token = token.lstrip("/")
-    alias_map = _aliases_maps(mani)
-    head, _, tail = token.partition("/")
-    base = alias_map.get(head, head)
-    rel = base if not tail else f"{base}/{tail}"
-    abs_path = os.path.realpath(os.path.join(project_root, rel))
-    rroot = os.path.realpath(project_root)
-    if not (abs_path == rroot or abs_path.startswith(rroot + os.sep)):
-        raise HTTPException(400, f"invalid path: {rel}")
-    return os.path.relpath(abs_path, project_root).replace("\\", "/")
+    # approval ON → write into output_pending; otherwise write_dir as-is
+    final_write_rel = m.get("write_dir", "output")
+    write_dir_rel = "output_pending" if REQUIRE_APPROVAL else final_write_rel
+    write_dir_abs = os.path.join(project_root, write_dir_rel)
+    os.makedirs(write_dir_abs, exist_ok=True)
 
-def _read_text_safe(abs_path: str) -> str:
-    size = os.path.getsize(abs_path)
-    if size > MAX_READ_BYTES:
-        raise HTTPException(413, f"file too large to inline ({size} bytes > {MAX_READ_BYTES})")
-    with open(abs_path, "rb") as f:
-        data = f.read()
-    if b"\x00" in data:
-        raise HTTPException(415, "binary file is not previewable")
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("utf-8", errors="replace")
+    m["_project_root"] = project_root
+    m["_read_dirs_rel"] = read_dirs_rel
+    m["_read_dirs_abs"] = read_dirs_abs
+    m["_write_dir_rel"] = write_dir_rel
+    m["_write_dir_abs"] = write_dir_abs
+    m["_final_write_rel"] = final_write_rel
+    return m
 
-def _ensure_parent_dir(abs_path: str):
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+def build_alias_hint(manifest: Dict[str, Any]) -> str:
+    aliases: Dict[str, str] = manifest.get("aliases", {})
+    if not aliases:
+        return ""
+    lines = ["\nPROJECT FILE ALIASES (use with Read/Write):"]
+    for k, v in aliases.items():
+        lines.append(f"- {k} => {v}")
+    lines.append(
+        "When the user mentions an alias (e.g., @routes), use Read/Write with "
+        "paths relative to the project root. If target does not exist, create it "
+        "under the current write directory shown above."
+    )
+    return "\n".join(lines)
 
-# ========== プロジェクト API ==========
+def make_system_prompt(m: Dict[str, Any]) -> str:
+    """System prompt with path normalization & append rules."""
+    return (
+        "You are a careful coding assistant working inside a team project.\n"
+        "Rules:\n"
+        f"- Project root: {m['_project_root']}\n"
+        f"- Read-only dirs: {', '.join(m['_read_dirs_rel'])}\n"
+        f"- Current write dir (CWD for Write): {m['_write_dir_rel']}\n"
+        "- Always show concrete relative paths you touched.\n"
+        "- Prefer Read/Write tools with explicit relative paths.\n"
+        # Path normalization so the model doesn't create nested folders
+        f"- IMPORTANT: The Write tool's working directory is {m['_write_dir_rel']}. "
+        f"If you see a path starting with '{m['_write_dir_rel']}/' (e.g., '@{m['_write_dir_rel']}/foo.md'), "
+        "STRIP that leading folder and write to the relative path instead (write 'foo.md'). "
+        "Do NOT create nested '<write_dir>/<write_dir>/' paths.\n"
+        # Append workflow to reduce 'no-op' writes
+        "- For 'append' requests: Read the existing file, merge by appending your new section, "
+        "then Write the full updated content back to the SAME filename.\n"
+    )
+
+# ------------------------------------------------------------
+# Health
+# ------------------------------------------------------------
+@app.get("/_health")
+def _health():
+    return {"ok": True, "anthropic_key": bool(os.getenv("ANTHROPIC_API_KEY"))}
+
+# ------------------------------------------------------------
+# FS APIs (list/search/preview)
+# ------------------------------------------------------------
 @app.get("/projects")
 async def list_projects():
     items = []
@@ -167,22 +185,20 @@ async def get_project(project_id: str):
         "id": project_id,
         "name": m.get("name", project_id),
         "aliases": m.get("aliases", {}),
-        "read_dirs": m.get("read_dirs", []),
-        "write_dir": m.get("write_dir", "output"),
+        "read_dirs": m["_read_dirs_rel"],
+        "write_dir": m["_write_dir_rel"],          # current (may be output_pending)
+        "final_write_dir": m["_final_write_rel"],  # after approval
+        "require_approval": REQUIRE_APPROVAL,
     }
 
-# ========== ファイルツリー ==========
 @app.get("/projects/{project_id}/fs")
 async def list_fs(project_id: str, path: Optional[str] = None):
-    """
-    ルートなし: read_dirs + write_dir を返す
-    pathあり : その配下の子を返す
-    """
     m = load_manifest(project_id)
     project_root = m["_project_root"]
-    read_dirs = list(m.get("read_dirs", []))
-    write_dir = m.get("write_dir", "output")
-    roots_rel = list(dict.fromkeys(read_dirs + [write_dir]))
+
+    roots_rel = list(m["_read_dirs_rel"])
+    if m["_write_dir_rel"] not in roots_rel:
+        roots_rel.append(m["_write_dir_rel"])
     roots_abs = [os.path.join(project_root, r) for r in roots_rel]
 
     if not path:
@@ -200,21 +216,22 @@ async def list_fs(project_id: str, path: Optional[str] = None):
         raise HTTPException(400, "not a directory")
 
     items = []
-    with os.scandir(abs_target) as it:
-        for e in it:
-            name = e.name
-            if name in IGNORE_NAMES or name.startswith("."):
-                continue
-            typ = "dir" if e.is_dir(follow_symlinks=False) else "file"
-            items.append({
-                "name": name,
-                "rel": os.path.join(path, name).replace("\\", "/"),
-                "type": typ
-            })
+    try:
+        with os.scandir(abs_target) as it:
+            for e in it:
+                name = e.name
+                if name in IGNORE_NAMES or name.startswith("."):
+                    continue
+                items.append({
+                    "name": name,
+                    "rel": os.path.join(path, name).replace("\\", "/"),
+                    "type": "dir" if e.is_dir(follow_symlinks=False) else "file"
+                })
+    except FileNotFoundError:
+        items = []
     items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
     return {"items": items}
 
-# ========== 検索 ==========
 @app.get("/projects/{project_id}/search")
 async def search_files(project_id: str, q: str, limit: int = 200):
     if not q:
@@ -223,13 +240,13 @@ async def search_files(project_id: str, q: str, limit: int = 200):
 
     m = load_manifest(project_id)
     project_root = m["_project_root"]
-    read_dirs = list(m.get("read_dirs", []))
-    write_dir = m.get("write_dir", "output")
-    roots_rel = list(dict.fromkeys(read_dirs + [write_dir]))
+    roots_rel = list(m["_read_dirs_rel"])
+    if m["_write_dir_rel"] not in roots_rel:
+        roots_rel.append(m["_write_dir_rel"])
+    roots_abs = [os.path.join(project_root, r) for r in roots_rel]
 
     results = []
-    for r_rel in roots_rel:
-        r_abs = os.path.join(project_root, r_rel)
+    for r_abs, r_rel in zip(roots_abs, roots_rel):
         if not os.path.exists(r_abs):
             continue
         for dirpath, dirnames, filenames in os.walk(r_abs):
@@ -247,7 +264,6 @@ async def search_files(project_id: str, q: str, limit: int = 200):
                     return {"items": results}
     return {"items": results}
 
-# ========== ファイルプレビュー ==========
 @app.get("/projects/{project_id}/file")
 async def get_file(project_id: str, path: str):
     if not path:
@@ -255,9 +271,10 @@ async def get_file(project_id: str, path: str):
 
     m = load_manifest(project_id)
     project_root = m["_project_root"]
-    read_dirs = list(m.get("read_dirs", []))
-    write_dir = m.get("write_dir", "output")
-    roots_rel = list(dict.fromkeys(read_dirs + [write_dir]))
+
+    roots_rel = list(m["_read_dirs_rel"])
+    if m["_write_dir_rel"] not in roots_rel:
+        roots_rel.append(m["_write_dir_rel"])
     roots_abs = [os.path.join(project_root, r) for r in roots_rel]
 
     abs_path = _safe_join(project_root, path)
@@ -270,10 +287,10 @@ async def get_file(project_id: str, path: str):
     mime, _ = mimetypes.guess_type(abs_path)
     with open(abs_path, "rb") as f:
         data = f.read(min(size, MAX_PREVIEW_BYTES))
-    is_binary = (b"\x00" in data)
+
     is_text = False
-    text = None
-    if not is_binary:
+    text = ""
+    if b"\x00" not in data:
         try:
             text = data.decode("utf-8")
             is_text = True
@@ -295,145 +312,33 @@ async def get_file(project_id: str, path: str):
         resp["note"] = "binary or unsupported text; preview omitted"
     return resp
 
-# ========== LLM（テキストのみ；ツール不使用） ==========
-async def _llm_complete_text(prompt: str) -> str:
-    """ツールを使わず、テキスト回答だけを1ターンで取得"""
-    options = ClaudeCodeOptions(
-        system_prompt="You are a concise Japanese summarizer. Output ONLY the Markdown body.",
-        max_turns=1,
-        allowed_tools=[],  # ツール呼び出し禁止
-    )
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(prompt)
-        chunks: List[str] = []
-        async for message in client.receive_response():
-            if hasattr(message, "content") and isinstance(message.content, list):
-                for block in message.content:
-                    if hasattr(block, "text") and isinstance(block.text, str):
-                        chunks.append(block.text)
-        return "".join(chunks).strip()
-
-# ========== タスク特化：要約→保存 ==========
-def _looks_like_summarize(prompt: str, rels: List[str]) -> bool:
-    kw = ("要約", "まとめ", "summarize", "summary")
-    has_kw = any(k in prompt for k in kw)
-    has_in = any(r.startswith("input/") for r in rels)
-    has_out = any(r.startswith("output/") for r in rels)
-    return has_kw and has_in and has_out
-
-async def _run_summarize_task(project_id: str, prompt: str) -> Dict[str, Any]:
-    mani = load_manifest(project_id)
-    project_root = mani["_project_root"]
-    write_dir = mani.get("write_dir", "output")
-
-    # 1) メンション抽出 → 相対パスへ
-    raw_mentions = _extract_mentions(prompt)
-    rels = [_resolve_rel(project_root, mani, r) for r in raw_mentions]
-
-    input_rel: Optional[str] = next((r for r in rels if r.startswith("input/")), None)
-    guide_rel: Optional[str] = next((r for r in rels if r.startswith("guideline/")), None)
-    out_rel: Optional[str]   = next((r for r in rels if r.startswith(f"{write_dir}/")), None)
-    if not input_rel or not out_rel:
-        raise HTTPException(400, "summarize task requires @input/... and @output/... mentions")
-
-    # 2) 入力・ガイドライン読み込み
-    input_abs = os.path.join(project_root, input_rel)
-    if not os.path.isfile(input_abs):
-        raise HTTPException(404, f"not a file: @{input_rel}")
-    src_text = _read_text_safe(input_abs)
-
-    guide_text = None
-    if guide_rel:
-        guide_abs = os.path.join(project_root, guide_rel)
-        if not os.path.isfile(guide_abs):
-            raise HTTPException(404, f"not a file: @{guide_rel}")
-        guide_text = _read_text_safe(guide_abs)
-
-    # 3) 出力先（ディレクトリ指定なら自動命名）
-    out_is_dir = out_rel.endswith("/") or os.path.isdir(os.path.join(project_root, out_rel))
-    if out_is_dir:
-        stem = pathlib.Path(input_rel).stem or "summary"
-        out_rel = f"{write_dir}/{stem}-summary.md"
-    if not out_rel.startswith(f"{write_dir}/"):
-        raise HTTPException(403, f"write must be under @{write_dir}: got @{out_rel}")
-    out_abs = os.path.join(project_root, out_rel)
-
-    # 4) プロンプト合成 → 要約生成（ツールなし）
-    sys = (
-        "あなたは日本語のドキュメント要約アシスタントです。"
-        "入力テキストを簡潔にMarkdownで要約してください。"
-        "見出し/箇条書きを適宜使い、余計な前置きは書かないでください。"
-    )
-    parts = [
-        "### 入力テキスト",
-        "```text",
-        src_text,
-        "```",
-    ]
-    if guide_text:
-        parts += ["### ガイドライン", "```text", guide_text, "```"]
-    parts += ["### 要求", "上記を要約し、Markdown本文のみを出力してください。"]
-    composed = sys + "\n\n" + "\n".join(parts)
-
-    md = await _llm_complete_text(composed)
-
-    # 5) 保存
-    _ensure_parent_dir(out_abs)
-    with open(out_abs, "w", encoding="utf-8") as f:
-        f.write(md)
-
-    return {
-        "text": f"✅ DONE: @{out_rel}\n\n（Files からプレビューできます）",
-        "meta": {
-            "task": "summarize",
-            "project_id": project_id,
-            "input": f"@{input_rel}",
-            "guideline": (f"@{guide_rel}" if guide_rel else None),
-            "output": f"@{out_rel}",
-        }
-    }
-
-# ========== /ask：B案に自動分岐＋フォールバックでツール実行 ==========
+# ------------------------------------------------------------
+# /ask (batch)
+# ------------------------------------------------------------
 @app.post("/ask")
 async def ask(body: AskBody):
     m = load_manifest(body.project_id)
 
-    # ---- まずは B案（要約→保存）を判定 ----
-    mentions = _extract_mentions(body.prompt)
-    try:
-        rels = [_resolve_rel(m["_project_root"], m, r) for r in mentions]
-    except HTTPException:
-        rels = []
-    if _looks_like_summarize(body.prompt, rels):
-        return await _run_summarize_task(body.project_id, body.prompt)
-
-    # ---- フォールバック：ツール実行エージェント（止まり対策: 自動承認ON）----
-    system_prompt = (
-        "You are a careful coding assistant working inside a team project.\n"
-        "Rules:\n"
-        f"- Operate strictly under the project root: {m['_project_root']}\n"
-        f"- Read-only dirs: {', '.join(m.get('read_dirs', []))}\n"
-        f"- Write dir: {m.get('write_dir','output')}\n"
-        "- Prefer using Read/Write with explicit relative paths and show concrete paths you touched.\n"
-        "- If you create files, put them under the write dir.\n"
-    )
-
+    system_prompt = make_system_prompt(m)
     options = ClaudeCodeOptions(
         system_prompt=system_prompt,
         max_turns=8,
         allowed_tools=["Read", "Write", "Bash"],
         cwd=m["_write_dir_abs"],
         add_dirs=m["_read_dirs_abs"],
-        permission_mode="acceptEdits",  # SDKが対応していれば自動承認
+        permission_mode=CLAUDE_PERMISSION_MODE,
     )
 
-    prompt = (
-        body.prompt
-        + build_alias_hint(m)
-        + "\n\nPlease actually perform Read/Write operations and end your answer with:\n"
-          "DONE: <@path or relative path> when you have finished."
-    )
+    user_prompt = body.prompt
+    prompt = user_prompt + build_alias_hint(m) + """
+MANDATORY ACTIONS:
+- Use the Read tool to actually open every referenced file (do not just say you'll read).
+- Produce the final artifact.
+- Use the Write tool to save under the current write dir shown above.
+- After writing, print the exact relative path as @<path> so the UI can detect it.
+"""
 
+    start_ts = time.time()
     try:
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
@@ -454,6 +359,188 @@ async def ask(body: AskBody):
                         "usage": getattr(message, "usage", None),
                     }
 
+            # detect files written during this call
+            written: List[str] = []
+            for root, _, files in os.walk(m["_write_dir_abs"]):
+                for name in files:
+                    p = os.path.join(root, name)
+                    try:
+                        if os.path.getmtime(p) >= start_ts - 0.5:
+                            rel = os.path.relpath(p, m["_project_root"]).replace("\\", "/")
+                            written.append(rel)
+                    except FileNotFoundError:
+                        pass
+
+            if meta is None:
+                meta = {}
+            meta.update({
+                "write_dir": m["_write_dir_rel"],
+                "final_write_dir": m["_final_write_rel"],
+                "require_approval": REQUIRE_APPROVAL,
+                "written": sorted(set(written)),
+            })
+
             return {"text": "".join(chunks), "meta": meta}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ------------------------------------------------------------
+# /ask/stream (SSE)
+# ------------------------------------------------------------
+@app.get("/ask/stream")
+async def ask_stream(project_id: str, prompt: str):
+    m = load_manifest(project_id)
+
+    system_prompt = make_system_prompt(m)
+    options = ClaudeCodeOptions(
+        system_prompt=system_prompt,
+        max_turns=8,
+        allowed_tools=["Read", "Write", "Bash"],
+        cwd=m["_write_dir_abs"],
+        add_dirs=m["_read_dirs_abs"],
+        permission_mode=CLAUDE_PERMISSION_MODE,
+    )
+
+    async def gen():
+        start_ts = time.time()
+        yield {"event": "status", "data": json.dumps({"stage": "open"})}
+        LOG.info("[SSE] open project=%s", project_id)
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                yield {"event": "status", "data": json.dumps({"stage": "query_start"})}
+                LOG.info("[SSE] query start")
+
+                await client.query(
+                    prompt + build_alias_hint(m)
+                    + "\n\nPlease perform the plan. Use the current write dir above when creating files."
+                )
+
+                yield {"event": "status", "data": json.dumps({"stage": "generating"})}
+                LOG.info("[SSE] generating…")
+
+                async for message in client.receive_response():
+                    LOG.debug("[SSE] msg: %s", getattr(message, "type", type(message)))
+                    if hasattr(message, "content") and isinstance(message.content, list):
+                        for block in message.content:
+                            if hasattr(block, "text") and isinstance(block.text, str):
+                                yield {"event": "chunk", "data": json.dumps({"text": block.text})}
+                    elif hasattr(message, "text") and isinstance(message.text, str):
+                        yield {"event": "chunk", "data": json.dumps({"text": message.text})}
+                    elif hasattr(message, "delta") and isinstance(getattr(message, "delta"), dict):
+                        t = message.delta.get("text")
+                        if isinstance(t, str) and t:
+                            yield {"event": "chunk", "data": json.dumps({"text": t})}
+
+                # notify files written
+                written = []
+                for root, _, files in os.walk(m["_write_dir_abs"]):
+                    for name in files:
+                        p = os.path.join(root, name)
+                        try:
+                            if os.path.getmtime(p) >= start_ts - 0.5:
+                                rel = os.path.relpath(p, m["_project_root"]).replace("\\", "/")
+                                written.append(rel)
+                        except FileNotFoundError:
+                            pass
+                for rel in sorted(set(written)):
+                    LOG.info("[SSE] file_written %s", rel)
+                    yield {"event": "file_written", "data": json.dumps({"path": f"@{rel}"})}
+
+                LOG.info("[SSE] done")
+                yield {"event": "done", "data": json.dumps({
+                    "ok": True,
+                    "write_dir": m["_write_dir_rel"],
+                    "final_write_dir": m["_final_write_rel"],
+                    "require_approval": REQUIRE_APPROVAL,
+                })}
+
+        except Exception as e:
+            LOG.exception("[SSE] error")
+            yield {"event": "error", "data": json.dumps({"message": str(e)})}
+
+    return EventSourceResponse(gen(), headers=_sse_headers(), ping=15)
+
+# ------------------------------------------------------------
+# Approval flow: promote / delete staged / diff
+# ------------------------------------------------------------
+@app.post("/projects/{project_id}/promote")
+async def promote_file(project_id: str, body: PromoteBody):
+    m = load_manifest(project_id)
+    project_root = m["_project_root"]
+
+    from_rel = (body.from_rel or "").lstrip("/")
+    if not from_rel.startswith(m["_write_dir_rel"] + "/"):
+        raise HTTPException(400, f"from_rel must start with {m['_write_dir_rel']}/")
+    src_abs = _safe_join(project_root, from_rel)
+    if not os.path.isfile(src_abs):
+        raise HTTPException(404, "staged file not found")
+
+    if body.to_rel:
+        to_rel = body.to_rel.lstrip("/")
+    else:
+        # keep same suffix under final_write_dir
+        suffix = from_rel.split("/", 1)[1] if "/" in from_rel else os.path.basename(from_rel)
+        to_rel = f"{m['_final_write_rel']}/{suffix}"
+
+    dst_abs = _safe_join(project_root, to_rel)
+    os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+
+    if os.path.exists(dst_abs) and not body.overwrite:
+        raise HTTPException(409, "destination exists")
+
+    shutil.copy2(src_abs, dst_abs)
+    return {"promoted_to": to_rel}
+
+@app.delete("/projects/{project_id}/staged")
+async def delete_staged(project_id: str, path: str):
+    m = load_manifest(project_id)
+    project_root = m["_project_root"]
+    rel = (path or "").lstrip("/")
+    if not rel.startswith(m["_write_dir_rel"] + "/"):
+        raise HTTPException(400, f"path must start with {m['_write_dir_rel']}/")
+    abs_p = _safe_join(project_root, rel)
+    if os.path.isfile(abs_p):
+        os.remove(abs_p)
+        return {"deleted": rel}
+    raise HTTPException(404, "not found")
+
+@app.get("/projects/{project_id}/diff")
+async def get_diff(project_id: str, from_rel: str, to_rel: Optional[str] = None):
+    m = load_manifest(project_id)
+    project_root = m["_project_root"]
+
+    from_rel = (from_rel or "").lstrip("/")
+    if not from_rel.startswith(m["_write_dir_rel"] + "/"):
+        raise HTTPException(400, f"from_rel must start with {m['_write_dir_rel']}/")
+    src_abs = _safe_join(project_root, from_rel)
+    if not os.path.isfile(src_abs):
+        raise HTTPException(404, "staged not found")
+
+    if not to_rel:
+        suffix = from_rel.split("/", 1)[1] if "/" in from_rel else os.path.basename(from_rel)
+        to_rel = f"{m['_final_write_rel']}/{suffix}"
+    dst_abs = _safe_join(project_root, to_rel)
+
+    def _read_lines(p):
+        if not os.path.exists(p):
+            return []
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines(keepends=False)
+
+    a = _read_lines(dst_abs)  # existing/final
+    b = _read_lines(src_abs)  # staged
+    udiff = difflib.unified_diff(a, b, fromfile=to_rel, tofile=from_rel, lineterm="")
+    return {"diff": "\n".join(list(udiff))}
+
+# ------------------------------------------------------------
+# Debug SSE (quick check)
+# ------------------------------------------------------------
+@app.get("/debug/stream")
+async def debug_stream():
+    async def gen():
+        for i in range(1, 6):
+            yield {"event": "chunk", "data": json.dumps({"text": f"[tick {i}]\n"})}
+            await asyncio.sleep(1)
+        yield {"event": "done", "data": json.dumps({"ok": True})}
+    return EventSourceResponse(gen(), headers=_sse_headers(), ping=10)

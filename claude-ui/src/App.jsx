@@ -6,17 +6,22 @@ import remarkGfm from "remark-gfm";
 const API_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
 export default function App() {
+  // プロジェクト & エイリアス
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState("");
   const [aliases, setAliases] = useState({});
+
+  // メッセージ
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // 入力UI
   const [isComposing, setIsComposing] = useState(false);
   const [focused, setFocused] = useState(false);
 
-  // サイドバー
-  const [activeSideTab, setActiveSideTab] = useState("files"); // 'files' | 'aliases'
+  // サイドバー（Files / Aliases / Staged）
+  const [activeSideTab, setActiveSideTab] = useState("files");
 
   // @補完
   const [suggestions, setSuggestions] = useState([]);
@@ -40,11 +45,43 @@ export default function App() {
   // プレビュー
   const [preview, setPreview] = useState({ open: false, info: null, loading: false, error: null });
 
+  // Staged（承認フロー）
+  const [staged, setStaged] = useState([]);
+  const [stagedBusy, setStagedBusy] = useState(false);
+  const [selectedStaged, setSelectedStaged] = useState(null);
+  const [stagedDiff, setStagedDiff] = useState("");
+  const [stagedErr, setStagedErr] = useState("");
+  const [stagedPending, setStagedPending] = useState({}); // { [rel]: 'approve'|'reject' }
+  const [flash, setFlash] = useState({});                 // { [rel]: 'approved'|'rejected' }
+
+  // Toasts
+  const [toasts, setToasts] = useState([]);               // [{id,type,title,msg}]
+  const toastIdRef = useRef(0);
+
   const textRef = useRef(null);
   const bottomRef = useRef(null);
   const qTimer = useRef(null);
+  const esRef = useRef(null); // EventSource
 
-  // 初回：プロジェクト一覧
+  // ----------- 初期化：Keyframes（spinner用） -----------
+  useEffect(() => {
+    const id = "global-keyframes-injected";
+    if (!document.getElementById(id)) {
+      const style = document.createElement("style");
+      style.id = id;
+      style.innerHTML = `@keyframes spin { to { transform: rotate(360deg); } }`;
+      document.head.appendChild(style);
+    }
+  }, []);
+
+  // ----------- Toastユーティリティ -----------
+  function pushToast({ type = "info", title = "", msg = "" }) {
+    const id = ++toastIdRef.current;
+    setToasts((t) => [...t, { id, type, title, msg }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
+  }
+
+  // ----------- 初回：プロジェクト一覧 -----------
   useEffect(() => {
     fetch(`${API_BASE}/projects`)
       .then((r) => r.json())
@@ -58,13 +95,15 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // プロジェクト切替：aliases / roots
+  // ----------- プロジェクト切替 -----------
   useEffect(() => {
     if (!projectId) return;
+    // aliases
     fetch(`${API_BASE}/projects/${projectId}`)
       .then((r) => r.json())
       .then((data) => setAliases(data.aliases || {}))
       .catch(() => {});
+    // roots
     fetch(`${API_BASE}/projects/${projectId}/fs`)
       .then((r) => r.json())
       .then((data) => {
@@ -73,16 +112,18 @@ export default function App() {
         setExpanded(new Set());
       })
       .catch(() => {});
-    // 検索をクリア
+    // staged
+    refreshStaged();
+    // 検索クリア
     setQ(""); setQResults([]);
   }, [projectId]);
 
-  // 自動スクロール
+  // ----------- 自動スクロール -----------
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  // 候補ポップの追従
+  // ----------- 候補ポップ位置追従 -----------
   useEffect(() => {
     const handler = () => recalcSuggestPosition();
     window.addEventListener("resize", handler);
@@ -93,7 +134,7 @@ export default function App() {
     };
   }, [showSuggest]);
 
-  // 右クリックメニューの外側クリックで閉じる
+  // ----------- 右クリックメニューの外側クリックで閉じる -----------
   useEffect(() => {
     const close = () => setCtx((c) => ({ ...c, show: false }));
     window.addEventListener("click", close);
@@ -101,6 +142,13 @@ export default function App() {
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
+    };
+  }, []);
+
+  // ----------- アンマウント時に EventSource を閉じる -----------
+  useEffect(() => {
+    return () => {
+      try { esRef.current?.close?.(); } catch {}
     };
   }, []);
 
@@ -197,7 +245,7 @@ export default function App() {
   };
   const closePreview = () => setPreview({ open: false, info: null, loading: false, error: null });
 
-  // 送信
+  // 送信（非ストリーム）
   const sendPrompt = async () => {
     const prompt = input.trim();
     if (!prompt || !projectId || loading) return;
@@ -213,10 +261,112 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setMessages((m) => [...m, { role: "assistant", text: data?.text ?? "(no text)", meta: data?.meta ?? null }]);
+      if (data?.meta?.require_approval) {
+        // 生成されたら pending を再読込
+        refreshStaged();
+      }
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", text: `Error: ${e.message}` }]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 送信（SSEストリーム）
+  const sendPromptStream = async () => {
+    const prompt = input.trim();
+    if (!prompt || !projectId || loading) return;
+    setLoading(true);
+    setMessages((m) => [...m, { role: "user", text: prompt, projectId }]);
+    setInput(""); resetTextareaHeight(textRef.current); setShowSuggest(false);
+
+    const assistantIndex = messages.length + 1; // 直後にassistantメッセージが入る想定
+    setMessages((m) => [...m, { role: "assistant", text: "", meta: null }]);
+
+    try {
+      const url = new URL(`${API_BASE}/ask/stream`);
+      url.searchParams.set("project_id", projectId);
+      url.searchParams.set("prompt", prompt);
+
+      // 既存接続があれば閉じる
+      try { esRef.current?.close?.(); } catch {}
+
+      const es = new EventSource(url.toString(), { withCredentials: false });
+      esRef.current = es;
+
+      es.addEventListener("open", () => {
+        // noop
+      });
+
+      es.addEventListener("status", (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          // statusはUI反映控えめでもOK（必要なら messages[assistantIndex] に追記）
+        } catch {}
+      });
+
+      es.addEventListener("chunk", (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          const t = data?.text ?? "";
+          if (!t) return;
+          setMessages((m) => {
+            const next = m.slice();
+            const idx = assistantIndex;
+            if (next[idx]) {
+              next[idx] = { ...next[idx], text: (next[idx].text || "") + t };
+            }
+            return next;
+          });
+        } catch {}
+      });
+
+      es.addEventListener("file_written", (ev) => {
+        // 生成ファイルを検出 → Staged一覧を更新
+        refreshStaged();
+        // 画面にも小さく反映 & トースト
+        try {
+          const data = JSON.parse(ev.data);
+          const path = data?.path || "";
+          pushToast({ type: "info", title: "File written", msg: path });
+          setMessages((m) => {
+            const next = m.slice();
+            const idx = assistantIndex;
+            if (next[idx]) {
+              next[idx] = { ...next[idx], text: (next[idx].text || "") + `\n\n✅ wrote ${path}` };
+            }
+            return next;
+          });
+        } catch {}
+      });
+
+      es.addEventListener("done", (ev) => {
+        try { es.close(); } catch {}
+        esRef.current = null;
+        setLoading(false);
+        try {
+          const data = JSON.parse(ev.data);
+          // meta 相当の情報は /projects/{id} で取れるので省略
+        } catch {}
+      });
+
+      es.addEventListener("error", (ev) => {
+        try { es.close(); } catch {}
+        esRef.current = null;
+        setLoading(false);
+        try {
+          const data = JSON.parse(ev.data);
+          setMessages((m) => [...m, { role: "assistant", text: `Error: ${data?.message || "stream error"}` }]);
+          pushToast({ type: "error", title: "Stream error", msg: String(data?.message || "") });
+        } catch {
+          setMessages((m) => [...m, { role: "assistant", text: `Stream error` }]);
+          pushToast({ type: "error", title: "Stream error", msg: "" });
+        }
+      });
+    } catch (e) {
+      setLoading(false);
+      setMessages((m) => [...m, { role: "assistant", text: `Error: ${e.message}` }]);
+      pushToast({ type: "error", title: "Stream setup failed", msg: String(e.message || e) });
     }
   };
 
@@ -241,7 +391,9 @@ export default function App() {
     }
   };
 
-  const clearAll = () => { setMessages([]); setInput(""); resetTextareaHeight(textRef.current); setShowSuggest(false); };
+  const clearAll = () => {
+    setMessages([]); setInput(""); resetTextareaHeight(textRef.current); setShowSuggest(false);
+  };
 
   // 文字列挿入（キャレット）
   const insertAtCaret = (token) => {
@@ -252,7 +404,12 @@ export default function App() {
     const sepAfter  = after  && !/^\s/.test(after)  ? " " : "";
     const next = `${before}${sepBefore}${token}${sepAfter}${after}`;
     setInput(next);
-    requestAnimationFrame(() => { el.focus(); const pos = (before + sepBefore + token).length; el.selectionStart = el.selectionEnd = pos; autoResize(el); });
+    requestAnimationFrame(() => {
+      el.focus();
+      const pos = (before + sepBefore + token).length;
+      el.selectionStart = el.selectionEnd = pos;
+      autoResize(el);
+    });
   };
 
   // 右クリックメニュー
@@ -266,8 +423,102 @@ export default function App() {
     copy(alias ? alias : "@" + rel);
   };
 
+  // ----------- Staged: 取得 -----------
+  async function refreshStaged() {
+    if (!projectId) return;
+    setStagedBusy(true);
+    try {
+      const pj = await fetch(`${API_BASE}/projects/${projectId}`).then(r => r.json());
+      const writeRoot = pj?.write_dir; // output_pending or write_dir
+      if (!writeRoot) { setStaged([]); setStagedBusy(false); return; }
+
+      const all = [];
+      // 再帰的に掘る
+      async function walk(rel) {
+        const r = await fetch(`${API_BASE}/projects/${projectId}/fs?path=${encodeURIComponent(rel)}`);
+        const data = await r.json();
+        const items = data.items || [];
+        for (const it of items) {
+          if (it.type === "dir") await walk(it.rel);
+          else all.push(it);
+        }
+      }
+      await walk(writeRoot);
+      setStaged(all);
+    } catch {
+      setStaged([]);
+    } finally {
+      setStagedBusy(false);
+    }
+  }
+
+  // ----------- Staged: Diff -----------
+  async function openStagedDiff(rel) {
+    setSelectedStaged(rel);
+    setStagedDiff(""); setStagedErr("");
+    try {
+      const u = new URL(`${API_BASE}/projects/${projectId}/diff`);
+      u.searchParams.set("from_rel", rel);
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      setStagedDiff(data?.diff || "(no diff)");
+    } catch (e) {
+      setStagedErr(String(e.message || e));
+    }
+  }
+  const closeStagedDiff = () => { setSelectedStaged(null); setStagedDiff(""); setStagedErr(""); };
+
+  // ----------- Staged: Approve / Reject -----------
+  async function approveStaged(rel) {
+    setStagedPending((m) => ({ ...m, [rel]: "approve" }));
+    try {
+      const r = await fetch(`${API_BASE}/projects/${projectId}/promote`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ project_id: projectId, from_rel: rel, overwrite: true })
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      pushToast({ type: "success", title: "Approved", msg: rel });
+      setFlash((f) => ({ ...f, [rel]: "approved" }));
+      setTimeout(() => setFlash((f) => { const n = { ...f }; delete n[rel]; return n; }), 1800);
+      await refreshStaged();
+      setSelectedStaged(null); setStagedDiff("");
+    } catch (e) {
+      pushToast({ type: "error", title: "Approve failed", msg: String(e.message || e) });
+    } finally {
+      setStagedPending((m) => { const n = { ...m }; delete n[rel]; return n; });
+    }
+  }
+
+  async function rejectStaged(rel) {
+    if (!confirm(`Reject this staged file?\n${rel}`)) return;
+    setStagedPending((m) => ({ ...m, [rel]: "reject" }));
+    try {
+      const u = new URL(`${API_BASE}/projects/${projectId}/staged`);
+      u.searchParams.set("path", rel);
+      const r = await fetch(u, { method: "DELETE" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      pushToast({ type: "success", title: "Rejected", msg: rel });
+      setFlash((f) => ({ ...f, [rel]: "rejected" }));
+      setTimeout(() => setFlash((f) => { const n = { ...f }; delete n[rel]; return n; }), 1800);
+      await refreshStaged();
+      setSelectedStaged(null); setStagedDiff("");
+    } catch (e) {
+      pushToast({ type: "error", title: "Reject failed", msg: String(e.message || e) });
+    } finally {
+      setStagedPending((m) => { const n = { ...m }; delete n[rel]; return n; });
+    }
+  }
+
+  // ----------- Render -----------
   return (
     <div style={styles.container}>
+      {/* アクセシビリティ: ライブ領域（トースト読み上げ） */}
+      <div aria-live="polite" style={styles.srOnly}>
+        {toasts.length ? `${toasts[toasts.length-1].title}: ${toasts[toasts.length-1].msg}` : ""}
+      </div>
+
       <header style={styles.header}>
         <h1 style={{ margin: 0, fontSize: 18 }}>Claude Code (Shared Projects)</h1>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
@@ -306,6 +557,7 @@ export default function App() {
           <div style={styles.tabs}>
             <button style={{ ...styles.tabBtn, ...(activeSideTab === "files" ? styles.tabActive : null) }} onClick={() => setActiveSideTab("files")}>Files</button>
             <button style={{ ...styles.tabBtn, ...(activeSideTab === "aliases" ? styles.tabActive : null) }} onClick={() => setActiveSideTab("aliases")}>Aliases</button>
+            <button style={{ ...styles.tabBtn, ...(activeSideTab === "staged" ? styles.tabActive : null) }} onClick={() => { setActiveSideTab("staged"); refreshStaged(); }}>Staged</button>
           </div>
 
           {activeSideTab === "files" && (
@@ -366,6 +618,60 @@ export default function App() {
             </>
           )}
 
+          {activeSideTab === "staged" && (
+            <>
+              <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:8 }}>
+                <button style={styles.clearSmall} onClick={refreshStaged}>{stagedBusy ? "Loading…" : "Refresh"}</button>
+                <span style={{ fontSize:12, opacity:.7 }}>{staged.length ? `${staged.length} file(s)` : "No staged files"}</span>
+                {!!staged.length && (
+                  <button
+                    style={{ ...styles.clearSmall, marginLeft: "auto" }}
+                    onClick={async () => {
+                      if (!confirm(`Approve all ${staged.length} file(s)?`)) return;
+                      for (const it of staged) { await approveStaged(it.rel); }
+                    }}>
+                    Approve All
+                  </button>
+                )}
+              </div>
+              <div style={styles.tree}>
+                {staged.map(it => (
+                  <div
+                    key={it.rel}
+                    style={{
+                      ...styles.searchRow,
+                      ...(flash[it.rel] === "approved" ? styles.flashApproved :
+                         flash[it.rel] === "rejected" ? styles.flashRejected : null)
+                    }}>
+                    <span>📄</span>
+                    <span style={{ overflow:"hidden", textOverflow:"ellipsis" }}>{it.rel}</span>
+                    <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
+                      <button
+                        style={{ ...styles.miniBtn, ...(stagedPending[it.rel] ? styles.miniBtnDisabled : null) }}
+                        onClick={() => openStagedDiff(it.rel)}
+                        disabled={!!stagedPending[it.rel]}>
+                        Diff
+                      </button>
+                      <button
+                        style={{ ...styles.miniBtn, ...(stagedPending[it.rel] ? styles.miniBtnDisabled : null) }}
+                        onClick={() => approveStaged(it.rel)}
+                        disabled={!!stagedPending[it.rel]}>
+                        {stagedPending[it.rel] === "approve" ? <Spinner /> : "Approve"}
+                      </button>
+                      <button
+                        style={{ ...styles.miniBtn, ...(stagedPending[it.rel] ? styles.miniBtnDisabled : null) }}
+                        onClick={() => rejectStaged(it.rel)}
+                        disabled={!!stagedPending[it.rel]}>
+                        {stagedPending[it.rel] === "reject" ? <Spinner /> : "Reject"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {!staged.length && <div style={{ opacity:.6, fontSize:12 }}>No items</div>}
+              </div>
+            </>
+          )}
+
           <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8, lineHeight: 1.6 }}>
             Enter: 送信 / Shift+Enter: 改行 / ⌘(Ctrl)+Enter: 送信 / <b>変換中は送信しません</b>
           </div>
@@ -384,7 +690,7 @@ export default function App() {
               onBlur={() => setFocused(false)}
               onCompositionStart={() => setIsComposing(true)}
               onCompositionEnd={(e) => { setIsComposing(false); setInput(e.currentTarget.value); autoResize(e.currentTarget); updateSuggestions(e.currentTarget); }}
-              placeholder="例）@routes を修正。関数 foo を bar にリネームして、pytest 計画を教えて。"
+              placeholder="例）@input/discussion.txt を @guideline/議事録.txt に沿って要約して @output に保存。"
               style={styles.textarea}
               rows={1}
             />
@@ -393,7 +699,10 @@ export default function App() {
               <SendIcon />
             </button>
           </div>
-          <button onClick={clearAll} style={styles.secondary}>Clear</button>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={sendPromptStream} disabled={loading || !input.trim() || !projectId} style={styles.secondary}>Stream</button>
+            <button onClick={clearAll} style={styles.secondary}>Clear</button>
+          </div>
         </div>
       </main>
 
@@ -451,6 +760,54 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Diffモーダル */}
+      {selectedStaged && (
+        <div style={styles.modalBackdrop} onClick={closeStagedDiff}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHead}>
+              <div style={{ fontWeight: 600 }}>Diff: {selectedStaged}</div>
+              <button style={styles.modalClose} onClick={closeStagedDiff}>✕</button>
+            </div>
+            <div style={styles.modalBody}>
+              {stagedErr && <div style={{ color:"crimson", marginBottom:8 }}>{stagedErr}</div>}
+              {!stagedErr && !stagedDiff && <div>Loading…</div>}
+              {!stagedErr && stagedDiff && (
+                <pre style={styles.codeBlock}><code>{stagedDiff}</code></pre>
+              )}
+            </div>
+            <div style={styles.modalFoot}>
+              <button
+                style={{ ...styles.secondary, ...(stagedPending[selectedStaged] ? styles.miniBtnDisabled : null) }}
+                onClick={() => approveStaged(selectedStaged)}
+                disabled={!!stagedPending[selectedStaged]}>
+                {stagedPending[selectedStaged] === "approve" ? <Spinner /> : "Approve"}
+              </button>
+              <button
+                style={{ ...styles.secondary, ...(stagedPending[selectedStaged] ? styles.miniBtnDisabled : null) }}
+                onClick={() => rejectStaged(selectedStaged)}
+                disabled={!!stagedPending[selectedStaged]}>
+                {stagedPending[selectedStaged] === "reject" ? <Spinner /> : "Reject"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toasts */}
+      <div style={styles.toastContainer}>
+        {toasts.map(t => (
+          <div key={t.id} style={{
+            ...styles.toast,
+            ...(t.type === "success" ? styles.toastSuccess :
+               t.type === "error"   ? styles.toastError   :
+               t.type === "info"    ? styles.toastInfo    : null)
+          }}>
+            <div style={{ fontWeight: 700, marginBottom: 2 }}>{t.title}</div>
+            <div style={{ fontSize: 12, opacity: .9 }}>{t.msg}</div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -505,7 +862,6 @@ function CodeRenderer({ inline, children, ...props }) {
 
 // --- caret utils ---
 function getAtPrefix(value, caret) { const left = value.slice(0, caret); const m = left.match(/@[\w\-\._/]*$/); return m ? m[0] : null; }
-function getAtPrefixRange(value, caret) { const left = value.slice(0, caret); const m = left.match(/@[\w\-\._/]*$/); if (!m) return { start: caret, end: caret }; return { start: caret - m[0].length, end: caret }; }
 function getCaretClientRect(el) {
   const taRect = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); const div = document.createElement("div");
   div.style.position = "fixed"; div.style.left = taRect.left + "px"; div.style.top = taRect.top + "px"; div.style.visibility = "hidden";
@@ -526,13 +882,14 @@ function resetTextareaHeight(el) { if (!el) return; el.style.height = "auto"; }
 
 // --- helpers ---
 function SendIcon() { return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 11.5l17-8-7.5 17-2-6-6-3z" stroke="currentColor" strokeWidth="1.8" fill="none" /></svg>); }
+function Spinner() { return <span style={styles.spinner} aria-hidden="true" />; }
 function formatBytes(n) { if (n < 1024) return `${n} B`; const kb = n / 1024; if (kb < 1024) return `${kb.toFixed(1)} KB`; const mb = kb / 1024; return `${mb.toFixed(1)} MB`; }
 
 // --- styles ---
 const styles = {
   container: { height: "100vh", display: "grid", gridTemplateRows: "48px 1fr", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" },
   header: { display: "flex", alignItems: "center", gap: 12, padding: "0 12px", borderBottom: "1px solid #eee", background: "#111827", color: "#e5e7eb" },
-  main: { display: "grid", gridTemplateColumns: "1fr 320px", gridTemplateRows: "1fr auto", gap: 12, padding: 12 },
+  main: { display: "grid", gridTemplateColumns: "1fr 340px", gridTemplateRows: "1fr auto", gap: 12, padding: 12 },
   messages: { gridColumn: "1 / 2", padding: 8, overflow: "auto" },
 
   sidebar: { gridColumn: "2 / 3", padding: 12, border: "1px solid #eee", borderRadius: 8, background: "#fafafa", height: "100%", overflow: "auto" },
@@ -551,6 +908,7 @@ const styles = {
   treeFile: { cursor: "pointer", userSelect: "none" },
   treeEmpty: { marginLeft: 18, opacity: 0.6, fontSize: 12 },
   miniBtn: { border: "1px solid #ddd", background: "#fff", borderRadius: 6, padding: "0 6px", cursor: "pointer", fontSize: 12 },
+  miniBtnDisabled: { opacity: .5, cursor: "not-allowed" },
 
   ul: { margin: 0, paddingLeft: 16 },
   linkBtn: { border: "none", background: "transparent", color: "#111827", textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 13 },
@@ -574,6 +932,7 @@ const styles = {
   sendIconBtn: { position: "absolute", right: 8, bottom: 8, width: 36, height: 36, borderRadius: 9999, border: "1px solid #111827", background: "#111827", color: "#fff", display: "grid", placeItems: "center", cursor: "pointer" },
   sendIconBtnDisabled: { opacity: 0.45, cursor: "not-allowed" },
   secondary: { padding: "8px 12px", borderRadius: 8, border: "1px solid #ddd", background: "#fff", color: "#333", cursor: "pointer", height: 40 },
+
   select: { height: 28, borderRadius: 6, padding: "0 8px" },
 
   suggestFloating: { position: "fixed", zIndex: 1000, minWidth: 220, maxWidth: 420, maxHeight: 240, overflowY: "auto", background: "#fff", border: "1px solid #e5e7eb", borderRadius: 8, boxShadow: "0 8px 24px rgba(0,0,0,.12)" },
@@ -606,4 +965,28 @@ const styles = {
   // 検索行
   searchRow: { display: "flex", alignItems: "center", gap: 8, padding: "4px 0" },
   aliasPath: { opacity: 0.7, fontSize: 12, marginLeft: 8 },
+
+  // Flash
+  flashApproved: { background: "rgba(16,185,129,.12)", transition: "background .6s" },
+  flashRejected: { background: "rgba(239,68,68,.12)", transition: "background .6s" },
+
+  // Spinner
+  spinner: {
+    display: "inline-block",
+    width: 14, height: 14,
+    borderRadius: "50%",
+    border: "2px solid rgba(0,0,0,.2)",
+    borderTopColor: "rgba(0,0,0,.6)",
+    animation: "spin 0.7s linear infinite"
+  },
+
+  // Toasts
+  toastContainer: { position: "fixed", right: 16, bottom: 16, display: "grid", gap: 8, zIndex: 3000 },
+  toast: { minWidth: 220, maxWidth: 360, padding: "10px 12px", borderRadius: 10, background: "#111827", color: "#fff", boxShadow: "0 8px 24px rgba(0,0,0,.2)", border: "1px solid rgba(255,255,255,.08)" },
+  toastSuccess: { background: "#065f46" },
+  toastError: { background: "#7f1d1d" },
+  toastInfo: { background: "#1f2937" },
+
+  // screen-reader only
+  srOnly: { position: "absolute", width: 1, height: 1, margin: -1, border: 0, padding: 0, overflow: "hidden", clip: "rect(0 0 0 0)" },
 };
